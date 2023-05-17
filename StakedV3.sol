@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity >=0.4.22 <0.9.0;
+pragma solidity ^0.8.10;
 
 import "./Ownable.sol";
 import "./TransferHelper.sol";
@@ -75,8 +75,10 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 	// 项目库
 	mapping(uint => pool) public pools;
 
-	event InvestToken(uint id,address user,uint amount,uint investType,uint cycle,uint time);
-	event ExtractToken(uint id,address user,address token,uint amount,uint tradeType,bytes sign,uint time);
+	event VerifyUpdate(address signer);
+	event Setting(address route,address quotev2,address compute,address factory,address weth,address manage);
+	event InvestToken(uint pid,address user,uint amount,uint investType,uint cycle,uint time);
+	event ExtractToken(uint pid,address user,address token,uint amount,uint tradeType,bytes sign,uint time);
 
 	constructor (address _route,address _quotev2,address _compute,address _signer) {
 		_setting(_route,_quotev2,_compute);
@@ -110,12 +112,6 @@ contract StakedV3 is Ownable,ReentrancyGuard {
         }
     }
 
-    function tokenExtract(
-        address _token,
-        uint _amount
-    ) public onlyOwner {
-        require(_tokenSend(_token,_amount),"Staked::extract fail");
-    }
 
 	function balanceOf(
 		address _token
@@ -452,13 +448,6 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		INonfungiblePositionManager(manage).safeTransferFrom(address(this),msg.sender,tokenId);
 	}
 
-	function withdrawFarmPosition(
-		uint id
-	) public onlyOwner {
-		IMasterChefV3(pools[id].farm).withdraw(pools[id].tokenId,address(this));
-		INonfungiblePositionManager(manage).safeTransferFrom(address(this),msg.sender,pools[id].tokenId);
-		pools[id].tokenId = 0;
-	}
 
 	function withdrawFarm(
 		uint id,
@@ -897,8 +886,6 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		require(pools[_id].pool == address(0),"Staked::project existent");
 		require(_point < pointMax.div(2),"Staked::invalid slippage");
 		require(_token0 != _token1,"Staked::invalid pair");
-		require(_token0 != address(0),"Staked::invalid token");
-		require(_token1 != address(0),"Staked::invalid token");
 
 		address tokenIn = _token0 == address(0) ? weth : _token0;
 		address tokenOut = _token1 == address(0) ? weth : _token1;
@@ -957,6 +944,10 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		pools[_id].inStatus = _in;
 		pools[_id].outStatus = _out;
 		pools[_id].point = _point;
+		require(_level0[0] > 0,"Staked::level0[0] > 0");
+		require(_level1[0] > 0,"Staked::level1[0] > 0");
+		require(_level0[1] > 0,"Staked::level0[1] > 0");
+		require(_level1[1] > 0,"Staked::level1[1] > 0");
 		pools[_id].wight0 = _level0[0];
 		pools[_id].wight1 = _level1[0];
 		pools[_id].lp0 = _level0[1];
@@ -998,6 +989,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		factory = ISwapRouter(_route).factory();
 		weth = ISwapRouter(_route).WETH9();
 		manage = ISwapRouter(_route).positionManager();
+		emit Setting(route,quotev2,compute,factory,weth,manage);
 	}
 
 	function autoFarm(
@@ -1012,6 +1004,9 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		isFarm = _auto;
 	}
 
+	
+
+
 	function verifySign(
 		address _signer
 	) public onlyOwner {
@@ -1023,6 +1018,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 	) private {
 		require(_signer != address(0),"Staked::invalid signing address");
 		signer = _signer;
+		emit VerifyUpdate(_signer);
 	}
 
 }
