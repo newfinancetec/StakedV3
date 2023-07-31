@@ -24,6 +24,8 @@ import "./IMasterChefV3.sol";
 import "./ICompute.sol";
 import "./INonfungiblePositionManager.sol";
 import "./IWETH9.sol";
+import "./IAssets.sol";
+import "./IDateFeed.sol";
 
 
 contract StakedV3 is Ownable,ReentrancyGuard {
@@ -34,15 +36,15 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 	address public route;
 	address public quotev2;
 	address public compute;
+	address public assets;
+	address public datafeed;
 
 	address public factory;
 	address public weth;
 	address public manage;
+
+	uint public fee;
 	
-	// struct Token {
-	// 	uint kind;			//1:ETH 2:WETH 3:ERC20
-	// 	address token;		//代币合约地址
-	// }
 
 	struct pool {
 		address token0; 		//质押币种合约地址
@@ -60,30 +62,41 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint lp1;
 	}
 
-	// 是否自动进行Farm
-	bool private isFarm = true;	
+	// struct limitRange {
+	// 	uint minIn;
+	// 	uint minOut;
+
+	// 	uint maxIn;
+	// 	uint maxOut;
+	// }
+	// mapping(bytes => limitRange) public limitGroup;
+
 	
+
+	// 是否自动进行Farm
+	mapping(uint => bool) public isFarm;
 	// 滑点最大比率 * 2
 	uint private pointMax = 10 ** 8;
-
-	// 提取签名验证地址
-	address private signer;
-	
-	// 禁用的证明
-	mapping(bytes => bool) expired;
-
 	// 项目库
 	mapping(uint => pool) public pools;
 
 	event VerifyUpdate(address signer);
 	event Setting(address route,address quotev2,address compute,address factory,address weth,address manage);
 	event InvestToken(uint pid,address user,uint amount,uint investType,uint cycle,uint time);
-	event ExtractToken(uint pid,address user,address token,uint amount,uint tradeType,bytes sign,uint time);
+	event ExtractToken(uint pid,address user,address token,uint amount,uint fee,uint tradeType,uint time);
 
-	constructor (address _route,address _quotev2,address _compute,address _signer) {
-		_setting(_route,_quotev2,_compute);
-		_verifySign(_signer);
+	constructor (
+		address _route,
+		address _quotev2,
+		address _compute,
+		address _assets,
+		address _datafeed,
+		uint _fee
+	) {
+		_setting(_route,_quotev2,_compute,_assets,_datafeed,_fee);
 	}
+
+	
 
 	// 接收ETH NFT
     receive() external payable {}
@@ -98,7 +111,6 @@ contract StakedV3 is Ownable,ReentrancyGuard {
         return this.onERC721Received.selector;
     }
 
-
 	function _tokenSend(
         address _token,
         uint _amount
@@ -111,7 +123,6 @@ contract StakedV3 is Ownable,ReentrancyGuard {
             result = token.transfer(msg.sender,_amount);
         }
     }
-
 
 	function balanceOf(
 		address _token
@@ -146,34 +157,19 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		result = amount.mul(rate).div(pointMax);
 	}
 
-	function hashMsg(
-		uint id,
-		address token,
-		uint amount,
-		uint deadline
-	) private view returns (bytes32 msghash) {
-		return	keccak256(
-            abi.encodePacked(
-                "\x19Ethereum Signed Message:\n32",
-                keccak256(abi.encodePacked(id,block.chainid,msg.sender,token,amount,deadline))
-            )
-        );
-	}
-
-
 	function abs(
 		int x
 	) private pure returns (int) {
 		return x >= 0 ? x : -x;
 	}
 
-	// 余额检查 尝试发放 返回是否发放成功
+	// Balance check attempted to distribute and returned whether the distribution was successful
 	function extractAmount(
 		address token,
 		uint amount
 	) private returns (bool) {
 		uint balance = balanceOf(token);
-		// 平台储量是否足够 足够直接发放
+		// Is the platform's storage sufficient for direct distribution
 		if(balance >= amount) {
 			if(token != weth) {
 				require(_tokenSend(token,amount),"Staked::extract fail");
@@ -186,7 +182,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		}
 	}
 
-	// 对失效的项目进行激活
+	// Activate failed projects
 	function Reboot(
 		uint id,
 		uint deadline
@@ -194,20 +190,20 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		
 		(bool pass,PoolToken memory tokens) = Challenge(id);
 		if(!pass) {
-			// 收割收益
+			// Harvest income
 			_harvest(id);
-			// 移除当前项目Farm的所有流动性
+			// Remove all liquidity from the current project Farm
 			_remove(id,tokens,deadline);
 
-			// 兑换成质押币种
+			// Exchange into pledged currency
 			_reSwap(id,tokens);
-			// 提现NFT
+			// Withdrawal of NFT
 			_withdraw(id);
 
-			// 更新最新币种价格比率
+			// Update the latest currency price ratio
 			wightReset(id);
 
-			// 单币种转成两个币种进行Farm
+			// Convert a single currency to two currencies for Farm
 			uint amount0 = lpRate(id);
 			(uint amountOut,) = _amountOut(id,pools[id].token0,pools[id].token1,amount0,false);
 
@@ -215,8 +211,68 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 			Mint(id,deadline);
 		}
 	}
+
+
+	function _removeSome(
+		uint id,
+		PoolToken memory tokens,
+		address token,
+		uint amount,
+		uint deadline
+	) private {
+		uint amountIn;
+		bytes memory path;
+		uint liquidityAmount;
+		uint min0;
+		uint min1;
+		if(tokens.token0 == token) {
+			if(tokens.amount0 == 0) {
+				path = abi.encodePacked(tokens.token1,pools[id].fee,tokens.token0);
+				(amountIn,,,) = IQuoterV2(quotev2).quoteExactOutput(path,amount);
+				liquidityAmount = amountIn * tokens.liquidity * 102 / tokens.amount1 / 100;
+
+				min0 = pointHandle(pools[id].point,0,false);
+				min1 = pointHandle(pools[id].point,amountIn,false);
+			}else {
+				amountIn = amount;
+				liquidityAmount = amountIn * tokens.liquidity * 102 / tokens.amount0 / 100;
+
+				min0 = pointHandle(pools[id].point,amountIn,false);
+				min1 = pointHandle(pools[id].point,0,false);
+			}
+		}else {
+			if(tokens.amount1 == 0) {
+				path = abi.encodePacked(tokens.token0,pools[id].fee,tokens.token1);
+				(amountIn,,,) = IQuoterV2(quotev2).quoteExactOutput(path,amount);
+				liquidityAmount = amountIn * tokens.liquidity * 102 / tokens.amount0 / 100;
+
+				min0 = pointHandle(pools[id].point,amountIn,false);
+				min1 = pointHandle(pools[id].point,0,false);
+			}else {
+				amountIn = amount;
+				liquidityAmount = amountIn * tokens.liquidity * 102 / tokens.amount1 / 100;
+
+				min0 = pointHandle(pools[id].point,0,false);
+				min1 = pointHandle(pools[id].point,amountIn,false);
+			}
+		}
+
+		
+		if(tokens.liquidity > 0) {
+			IMasterChefV3(pools[id].farm).decreaseLiquidity(
+				IMasterChefV3.DecreaseLiquidityParams({
+					tokenId:pools[id].tokenId,
+					liquidity:uint128(liquidityAmount),
+					amount0Min:min0,
+					amount1Min:min1,
+					deadline:deadline
+				})
+			);
+		}
+		unWrapped();
+	}
 	
-	// 提取Token 流动性失效时的处理
+	// Handling When Extracting Token Liquidity Fails
 	function invalid(
 		uint id,
 		address token,
@@ -224,15 +280,16 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint deadline,
 		PoolToken memory tokens
 	) private {
-		// 收割收益
-		_harvest(id);
-		// 移除当前项目Farm的所有流动性
-		_remove(id,tokens,deadline);
+		// Harvest income
+		// _harvest(id);
+		// Remove all liquidity from the current project Farm
+		// _remove(id,tokens,deadline);
+		_removeSome(id,tokens,token,amount,deadline);
 		// bytes memory path;
 		uint amountOut;
 		uint balance;
 
-		// 全部转换为提取币种
+		// Convert all to extraction currency
 		if(tokens.token0 == token) {
 			if(tokens.amount0 == 0) {
 				(amountOut,balance) = _amountOut(id,tokens.token1,tokens.token0,0,true);
@@ -244,25 +301,25 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 				Swap(id,tokens.token0,tokens.token1,balance,amountOut,0);
 			}
 		}
-		// 第二次尝试发放
+		// Second attempt to distribute
 		bool result = extractAmount(token,amount);
 		require(result,"Staked::extraction failed (invalid:Insufficient reserves1)");
-		// 提现NFT 以及重置Farm质押
+		/* // Withdrawal of NFT and Reset of Farm Pledge
 		_withdraw(id);
-		// 全部转换为质押币种
+		// Convert all to pledge currency
 		if(pools[id].token0 != token) {
 			(amountOut,balance) = _amountOut(id,pools[id].token1,pools[id].token0,0,true);
 			Swap(id,pools[id].token1,pools[id].token0,balance,amountOut,0);
 		}
 		
-		// 更新最新币种价格比率
+		// Update the latest currency price ratio
 		wightReset(id);
 
-		// 单币种转成两个币种进行Farm
+		// Convert a single currency to two currencies for Farm
 		uint amount0 = lpRate(id);
 		(amountOut,) = _amountOut(id,pools[id].token0,pools[id].token1,amount0,false);
 		Swap(id,pools[id].token0,pools[id].token1,amount0,amountOut,0);
-		Mint(id,deadline);
+		Mint(id,deadline); */
 	}
 	
 	function wightReset(
@@ -290,7 +347,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		require(tokens.liquidity > 0,"Staked::insufficient liquidity (valid)");
 		(tokens.amount0,tokens.amount1) = ICompute(compute).getAmountsForLiquidity(tokens.sqrtPriceX96,tokens.sqrtRatioAX96,tokens.sqrtRatioBX96,tokens.liquidity);
 		_remove(id,tokens,deadline);
-		// 尝试发放
+		// Attempt to distribute
 		bool result = extractAmount(token,amount);
 		uint balance;
 		if(!result) {
@@ -303,7 +360,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 				tokens.amount0 = tokens.amount0 > balance ? balance : tokens.amount0;
 				Swap(id,tokens.token0,tokens.token1,tokens.amount0,6,0);
 			}
-			// 尝试发放
+			// Attempt to distribute
 			result = extractAmount(token,amount);
 		}
 		return result;
@@ -326,14 +383,14 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		}else if(tokens.amount1 > 0) {
 			liquidity = tokens.liquidity * temp / tokens.amount1;
 		}
-		// 移除上浮2%
+		// Remove floating 2%
 		uint upAmount = liquidity * 102 / 100;
 		if(upAmount > tokens.liquidity) {
 			liquidity = liquidity * 101 / 100;
 		}else {
 			liquidity = upAmount;
 		}
-		// 第二三次
+		// The second and third times
 		bool result = tryRun(id,token,amount,deadline,tokens,liquidity);
 
 		if(!result) {
@@ -341,7 +398,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 			uint outAmount = amount.sub(balance).mul(102).div(100);
 			(,tokens) = Challenge(id);
 			liquidity = uint128(liquidity * outAmount / temp);
-			// 第四五次
+			// The fourth and fifth time
 			result = tryRun(id,token,amount,deadline,tokens,liquidity);
 		}
 		
@@ -355,14 +412,13 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint deadline
 	) private {
 		require(pools[id].token0 == token || pools[id].token1 == token,"Staked::does not support decompression");
-		require(pools[id].tokenId != 0,"Staked::insufficient liquidity (lpExtract)");
-		// 第一次尝试发放
+		// First attempt to distribute
 		bool result = extractAmount(token,amount);
-
+		
 		if(!result) {
-
+			require(pools[id].tokenId != 0,"Staked::insufficient liquidity (lpExtract)");
 			(bool pass,PoolToken memory tokens) = Challenge(id);
-			// 流动性是否失效
+			// Is liquidity ineffective
 			if(pass) {
 				valid(id,token,amount,deadline,tokens);
 			}else {
@@ -391,18 +447,21 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint tradeType,
 		address token,
 		uint amount,
-		uint deadline,
-		bytes memory signature
+		uint deadline
 	) public nonReentrant {
+		require(msg.sender == tx.origin,"Staked::Illegal caller");
+		require(!Address.isContract(msg.sender),"Staked::Prohibit contract calls");
 		require(pools[id].outStatus,"Staked::extract closed");
 		require(deadline > block.timestamp,"Staked::transaction lapsed");
-		require(!expired[signature],"Staked::certificate expired");
+		
+		
+		uint reduceAmount = amount;
+		// Asset inspection
+		amount = pointMax.sub(fee).mul(amount).div(pointMax);
+		uint total = IAssets(assets).asset(msg.sender,id,token);
+		require(total >= amount,"Staked::Overdrawing");
 
-		address prove = ECDSA.recover(hashMsg(id,token,amount,deadline), signature);
-		require(signer == prove,"Staked::invalid certificate");	
-		expired[signature] = true;
-
-		// 收益是否为构成lp的币种
+		// Is the income in the currency that constitutes lp
 		if(pools[id].token0 == token) {
 			lpExtract(id,token,amount,deadline);
 		} else if(pools[id].token1 == token) {
@@ -410,8 +469,9 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		} else {
 			unlpExtract(amount,token);
 		}
-
-		emit ExtractToken(id,msg.sender,token,amount,tradeType,signature,block.timestamp);
+		// Accounting
+		IAssets(assets).reduceAlone(msg.sender,id,token,reduceAmount);
+		emit ExtractToken(id,msg.sender,token,amount,reduceAmount.sub(amount),tradeType,block.timestamp);
 	}
 
 	function Convert(
@@ -448,7 +508,6 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		INonfungiblePositionManager(manage).safeTransferFrom(address(this),msg.sender,tokenId);
 	}
 
-
 	function withdrawFarm(
 		uint id,
 		uint deadline
@@ -463,7 +522,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint id
 	) private {
 		IMasterChefV3(pools[id].farm).withdraw(pools[id].tokenId,address(this));
-		// tokenId重置为0
+		// Reset tokenId to 0
 		pools[id].tokenId = 0;
 	}
 
@@ -475,9 +534,11 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint cycle,
 		uint deadline
 	) public payable nonReentrant {
+		require(msg.sender == tx.origin,"Staked::Illegal caller");
+		require(!Address.isContract(msg.sender),"Staked::Prohibit contract calls");
 		require(pools[id].inStatus,"Staked::invest project closed");
 		require(deadline > block.timestamp,"Staked::transaction lapsed");
-		// 质押代币
+		// Pledged Tokens
 		if(pools[id].token0 == weth) {
 			require(msg.value == amount,"Staked::input eth is not accurate");
 		}else {
@@ -486,33 +547,35 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint balance = balanceOf(pools[id].token0);
 		uint amount0 = lpRate(id);
 
-		if(isFarm) {
-			// 流动性检查
-			(bool pass,PoolToken memory tokens) = Challenge(id);
+		// Liquidity check
+		(bool pass,PoolToken memory tokens) = Challenge(id);
+
+		if(isFarm[id] && pass) {
+			
 			if(!pass) {
-				// 收割收益
+				// Harvest income
 				_harvest(id);
-				// 移除流动性
+				// Remove liquidity
 				_remove(id,tokens,deadline);
-				// 兑换成质押币种
+				// Exchange into pledged currency
 				_reSwap(id,tokens);
-				// 提现NFT
+				// Withdrawal of NFT
 				_withdraw(id);
-				// 更新最新币种价格比率
+				// Update the latest currency price ratio
 				wightReset(id);
 			}
-			// 代币兑换
-			// token0参与兑换的数量 滑点:0.5% (50% + 0.5%) * 合约中所有token0的数量
+			// Token exchange
+			// Number of tokens participating in redemption
 			balance = balanceOf(pools[id].token0);
 			amount0 = lpRate(id);
-			// quoteAmount 重新计算估值
+			// QuoteAmount Recalculate Valuation
 			if(!pass) {
 				(quoteAmount,) = _amountOut(id,pools[id].token0,pools[id].token1,amount0,false);
 			}
-			// 兑换token1代币 0:支出固定数量代币 
+			// Exchange token 1 token 0: Spend a fixed number of tokens
 			Swap(id,pools[id].token0,pools[id].token1,amount0,quoteAmount,0);
 
-			// 添加流动性
+			// Add liquidity
 			if(pools[id].tokenId == 0) {
 				// Mint
 				Mint(id,deadline);
@@ -522,6 +585,10 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 			}
 		}
 		if(amount > 0) {
+			// Accounting
+			if(investType == 1) {
+				IAssets(assets).plusAlone(msg.sender,id,pools[id].token0,amount);
+			}
 			emit InvestToken(id,msg.sender,amount,investType,cycle,block.timestamp);
 		}
 	}
@@ -539,7 +606,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint128 liquidity;
 	}
 
-	// 将无效流动性中的代币都兑换成质押代币
+	// Converting tokens from ineffective liquidity into pledged tokens
 	function _reSwap(
 		uint id,
 		PoolToken memory tokens
@@ -603,18 +670,43 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		unWrapped();
 	}
 
+	function MintTick(
+		uint id
+	) private view returns (uint160,uint160,uint160,int24,int24) {
+		(uint160 sqrtPriceX96,int24 tick,,,,,) = IUniswapV3Pool(pools[id].pool).slot0();
+		int24 tickSpacing = IUniswapV3Pool(pools[id].pool).tickSpacing();
+		int256 grap = abs(tick * pools[id].point.toInt256() / pointMax.toInt256());
+		int24 tickLower;
+		int24 tickUpper;
+		if(grap > tickSpacing) {
+			tickLower = int24((tick - grap) / tickSpacing * tickSpacing);
+			tickUpper = int24((tick + grap) / tickSpacing * tickSpacing);
+		}else {
+			int256 multiple = abs(tick / tickSpacing);
+			if(multiple >= 1) {
+				tickLower = int24(-tickSpacing * (multiple + 3));
+				tickUpper = int24(tickSpacing * (multiple + 3));
+			}else {
+				tickLower = int24(-tickSpacing * 3);
+				tickUpper = int24(tickSpacing * 3);
+			}
+			if(tickUpper > 887272) {
+				tickLower = int24(-887272 / tickSpacing * tickSpacing);
+				tickUpper = int24(887272 / tickSpacing * tickSpacing);
+			}
+		}
+	
+		uint160 sqrtRatioAX96 = ICompute(compute).sqrtRatioAtTick(tickLower);
+		uint160 sqrtRatioBX96 = ICompute(compute).sqrtRatioAtTick(tickUpper);
+		return (sqrtPriceX96,sqrtRatioAX96,sqrtRatioBX96,tickLower,tickUpper);
+	}
+
 	function Mint(
 		uint id,
 		uint deadline
 	) private {
-		(uint160 sqrtPriceX96,int24 tick,,,,,) = IUniswapV3Pool(pools[id].pool).slot0();
-		int24 tickSpacing = IUniswapV3Pool(pools[id].pool).tickSpacing();
-		int256 grap = abs(tick * pools[id].point.toInt256() / pointMax.toInt256());
-	
-		uint160 sqrtRatioAX96 = ICompute(compute).sqrtRatioAtTick(int24((tick - grap) / tickSpacing * tickSpacing));
-		uint160 sqrtRatioBX96 = ICompute(compute).sqrtRatioAtTick(int24((tick + grap) / tickSpacing * tickSpacing));
-
-		// 对应正确的币种以及数量
+		(uint160 sqrtPriceX96,uint160 sqrtRatioAX96,uint160 sqrtRatioBX96,int24 tickLower,int24 tickUpper) = MintTick(id);
+		// Corresponding correct currency and quantity
 		bool correct = pools[id].token0 < pools[id].token1;
 		PoolToken memory tokens;
 		if(correct) {
@@ -623,8 +715,8 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 				token1:pools[id].token1,
 				amount0:balanceOf(pools[id].token0),
 				amount1:balanceOf(pools[id].token1),
-				tickLower:int24((tick - grap) / tickSpacing * tickSpacing),
-				tickUpper:int24((tick + grap) / tickSpacing * tickSpacing),
+				tickLower:tickLower,
+				tickUpper:tickUpper,
 				sqrtPriceX96:sqrtPriceX96,
 				sqrtRatioAX96:sqrtRatioAX96,
 				sqrtRatioBX96:sqrtRatioBX96,
@@ -636,8 +728,8 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 				token1:pools[id].token0,
 				amount0:balanceOf(pools[id].token1),
 				amount1:balanceOf(pools[id].token0),
-				tickLower:int24((tick - grap) / tickSpacing * tickSpacing),
-				tickUpper:int24((tick + grap) / tickSpacing * tickSpacing),
+				tickLower:tickLower,
+				tickUpper:tickUpper,
 				sqrtPriceX96:sqrtPriceX96,
 				sqrtRatioAX96:sqrtRatioAX96,
 				sqrtRatioBX96:sqrtRatioBX96,
@@ -670,7 +762,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		}
 		uint amount0;
 		uint amount1;
-		// 添加流动性位置
+		// Add liquidity location
 		(pools[id].tokenId,,amount0,amount1) = INonfungiblePositionManager(manage).mint{ value:ethAmount }(
 			INonfungiblePositionManager.MintParams({
 				token0:tokens.token0,
@@ -693,7 +785,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 			pools[id].lp0 = amount1;
 			pools[id].lp1 = amount0;
 		}
-		// Farm质押
+		// Farm Pledge
 		INonfungiblePositionManager(manage).safeTransferFrom(address(this),pools[id].farm,pools[id].tokenId);
 	}
 
@@ -793,7 +885,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 	}
 	
 
-	// side 0:支出固定数量代币 1:入账固定数量代币
+	// Side 0: Spending fixed quantity tokens 1: Booking fixed quantity tokens
 	function Swap(
 		uint id,
 		address tokenIn,
@@ -811,7 +903,8 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 			inAmount = pointHandle(pools[id].point,inAmount,true);
 		}
 		if(inAmount > 0 && outAmount > 0) {
-			_swap(tokenIn,inAmount,outAmount,path,side);
+			(uint input,uint output) = _swap(tokenIn,inAmount,outAmount,path,side);
+			require(IDateFeed(datafeed).priceCheck(tokenIn,input,tokenOut,output),"Staked::Excessive price fluctuations");
 		}
 		return (inAmount,outAmount);
 	}
@@ -822,56 +915,41 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint outAmount,
 		bytes memory path,
 		uint side
-	) private {
+	) private returns (uint,uint) {
 		uint ethAmount = 0;
 		if(tokenIn != weth) {
 			TransferHelper.safeApprove(tokenIn,route,inAmount);
 		}else {
 			ethAmount = inAmount;
 		}
+		uint amountOut;
+		uint amountIn;
 		
 		if(side == 0) {
-			// 进行固定输入的兑换,如果执行失败，重新获取汇率尝试再次执行
-			try ISwapRouter(route).exactInput{ value:ethAmount }(
+			// Perform a fixed input exchange, if the execution fails, retrieve the exchange rate and try to execute it again
+			amountOut = ISwapRouter(route).exactInput{ value:ethAmount }(
 				ISwapRouter.ExactInputParams({
 					path:path,
 					recipient:address(this),
 					amountIn:inAmount,
 					amountOutMinimum:outAmount
 				})
-			) {} catch {
-				(outAmount,,,) = IQuoterV2(quotev2).quoteExactInput(path,inAmount);
-				ISwapRouter(route).exactInput{ value:ethAmount }(
-					ISwapRouter.ExactInputParams({
-						path:path,
-						recipient:address(this),
-						amountIn:inAmount,
-						amountOutMinimum:outAmount
-					})
-				);
-			}
+			);
+			amountIn = inAmount;
 		}else if(side == 1) {
-			// 进行固定输出的兑换,如果执行失败，重新获取汇率尝试再次执行
-			try ISwapRouter(route).exactOutput{ value:ethAmount }(
+			// Perform a fixed output exchange, if the execution fails, retrieve the exchange rate and try to execute it again
+			amountIn = ISwapRouter(route).exactOutput{ value:ethAmount }(
 				ISwapRouter.ExactOutputParams({
 					path:path,
 					recipient:address(this),
 					amountOut:outAmount,
 					amountInMaximum:inAmount
 				})
-			) {} catch {
-				(inAmount,,,) = IQuoterV2(quotev2).quoteExactOutput(path,outAmount);
-				ISwapRouter(route).exactOutput{ value:ethAmount }(
-					ISwapRouter.ExactOutputParams({
-						path:path,
-						recipient:address(this),
-						amountOut:outAmount,
-						amountInMaximum:inAmount
-					})
-				);
-			}
+			);
+			amountOut = outAmount;
 		}
 		unWrapped();
+		return (amountIn,amountOut);
 	}
 
 	function poolCreat(
@@ -884,7 +962,7 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint[] memory _level1
 	) public onlyOwner nonReentrant {
 		require(pools[_id].pool == address(0),"Staked::project existent");
-		require(_point < pointMax.div(2),"Staked::invalid slippage");
+		require(_point < pointMax,"Staked::invalid slippage");
 		require(_token0 != _token1,"Staked::invalid pair");
 
 		address tokenIn = _token0 == address(0) ? weth : _token0;
@@ -911,9 +989,10 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 			lp0:_level0[1],
 			lp1:_level1[1]
 		});
+		_autoFarm(_id,true);
 	}
 
-	// 计算质押前 通过价值以及流动性比率 计算参与兑换的金额
+	// Calculate the amount of participation in exchange through value and liquidity ratio before calculating the pledge
 	function lpRate(
 		uint id
 	) public view returns (uint inAmount) {
@@ -932,6 +1011,8 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		}
 	}
 
+
+
 	function poolControl(
 		uint _id,
 		bool _in,
@@ -940,10 +1021,11 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		uint[] memory _level0,
 		uint[] memory _level1
 	) public onlyOwner {
-		require(_point < pointMax.div(2),"Staked::invalid slippage");
+		require(_point < pointMax,"Staked::invalid slippage");
 		pools[_id].inStatus = _in;
 		pools[_id].outStatus = _out;
 		pools[_id].point = _point;
+
 		require(_level0[0] > 0,"Staked::level0[0] > 0");
 		require(_level1[0] > 0,"Staked::level1[0] > 0");
 		require(_level0[1] > 0,"Staked::level0[1] > 0");
@@ -954,31 +1036,25 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		pools[_id].lp1 = _level1[1];
 	}
 
-	function poolTokenID(
-		uint _id,
-		uint _tokenId
-	) public onlyOwner {
-		// (,,address token0,address token1,uint24 fee,,,,,,,) = INonfungiblePositionManager(manage).positions(_tokenId);
-		// address _pool = IUniswapV3Factory(factory).getPool(token0,token1,fee);
-		// require(_pool == pools[_id].pool,"Staked::invalid tokenId");
-		pools[_id].tokenId = _tokenId;
-		// address owner = INonfungiblePositionManager(manage).ownerOf(_tokenId);
-		// require(owner == address(this),"Staked::invalid nft");
-		INonfungiblePositionManager(manage).safeTransferFrom(address(this),pools[_id].farm,pools[_id].tokenId);
-	}
 
 	function setting(
 		address _route,
 		address _quotev2,
-		address _compute
+		address _compute,
+		address _assets,
+		address _datafeed,
+		uint _fee
 	) public onlyOwner {
-		_setting(_route,_quotev2,_compute);
+		_setting(_route,_quotev2,_compute,_assets,_datafeed,_fee);
 	}
 
 	function _setting(
 		address _route,
 		address _quotev2,
-		address _compute
+		address _compute,
+		address _assets,
+		address _datafeed,
+		uint _fee
 	) private {
 		require(_route != address(0),"Staked::invalid route address");
 		require(_quotev2 != address(0),"Staked::invalid quotev2 address");
@@ -986,6 +1062,9 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 		route = _route;
 		quotev2 = _quotev2;
 		compute = _compute;
+		assets = _assets;
+		datafeed = _datafeed;
+		fee = _fee;
 		factory = ISwapRouter(_route).factory();
 		weth = ISwapRouter(_route).WETH9();
 		manage = ISwapRouter(_route).positionManager();
@@ -993,32 +1072,17 @@ contract StakedV3 is Ownable,ReentrancyGuard {
 	}
 
 	function autoFarm(
+		uint _id,
 		bool _auto
 	) public onlyOwner {
-		_autoFarm(_auto);
+		_autoFarm(_id,_auto);
 	}
 
 	function _autoFarm(
+		uint _id,
 		bool _auto
 	) private {
-		isFarm = _auto;
-	}
-
-	
-
-
-	function verifySign(
-		address _signer
-	) public onlyOwner {
-		_verifySign(_signer);
-	}
-
-	function _verifySign(
-		address _signer
-	) private {
-		require(_signer != address(0),"Staked::invalid signing address");
-		signer = _signer;
-		emit VerifyUpdate(_signer);
+		isFarm[_id] = _auto;
 	}
 
 }
